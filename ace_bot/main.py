@@ -1,3 +1,17 @@
+"""
+main.py — ACE Bot v2.0.0
+══════════════════════════
+Joe's autonomous executive assistant.
+
+v2.0.0 changes:
+  - MUSE memory wired into every message handler
+  - MUSE context injected into system prompt before every reply
+  - Outcome captured after every reply (reflect + consolidate)
+  - /status now includes live MUSE memory summary
+  - Positive signal detection ("perfect", "exactly", "great")
+  - Correction signal detection ("that's wrong", "no", "incorrect")
+"""
+
 import os
 import logging
 from telegram import Update
@@ -9,109 +23,153 @@ from ace_bot.voice import VoiceHandler
 from ace_bot.memory import MemoryHandler
 from ace_bot.n8n_bridge import N8NBridge
 
-# Load environment variables
 load_dotenv()
 
-# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
 # Initialize handlers
-llm = LLMHandler()
-voice = VoiceHandler()
+llm    = LLMHandler()
+voice  = VoiceHandler()
 memory = MemoryHandler()
-n8n = N8NBridge()
+n8n    = N8NBridge()
+
+# Positive / correction signal words
+POSITIVE_SIGNALS  = {"perfect", "exactly", "great", "correct", "excellent", "yes", "thank you", "thanks"}
+NEGATIVE_SIGNALS  = {"wrong", "incorrect", "no", "not right", "that's not", "stop", "bad answer"}
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "Welcome, Sir. I am ACE, your Personal AI Assistant.\n\n"
-        "I am online and ready to assist you with your schedule, meetings, and communications.\n\n"
+    await update.message.reply_text(
+        "Sir. ACE online.\n\n"
+        "I am your executive assistant. I remember everything.\n"
+        "Every interaction makes me sharper.\n\n"
         "Commands:\n"
-        "/status - Check system health\n"
-        "/morning - Trigger morning briefing\n"
-        "Or simply send me a text or voice message."
+        "/status  — System health + memory summary\n"
+        "/morning — Morning briefing\n\n"
+        "Or just talk to me."
     )
-    await update.message.reply_text(welcome_text)
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mem_summary = memory.memory_summary()
     status_msg = (
-        "🛡️ ACE System Status:\n"
-        "✅ Brain: Letta (Ready)\n"
-        "✅ LLM: Gemini 1.5 Flash (Online)\n"
+        "🛡️ ACE System Status\n"
+        "═══════════════════════\n"
+        "✅ Brain: Gemini / Groq (Online)\n"
         "✅ Automation: n8n (Connected)\n"
-        "✅ Voice: ElevenLabs / Groq Whisper (Active)"
+        "✅ Voice: ElevenLabs / Groq Whisper (Active)\n\n"
+        f"{mem_summary}"
     )
     await update.message.reply_text(status_msg)
 
+
 async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Initiating your morning briefing, Sir. Querying n8n and Fathom...")
-    # Trigger n8n workflow
-    n8n.trigger_morning_briefing(update.effective_user.id)
-    
-    # Placeholder response (since n8n is async/webhook based)
-    briefing = llm.chat("Generate a professional morning greeting for a business executive named Joe. Mention that ACE is preparing the briefing.")
-    await update.message.reply_text(briefing)
+    await update.message.reply_text("Initiating morning briefing, Sir...")
+    user_id = update.effective_user.id
+    n8n.trigger_morning_briefing(user_id)
+
+    user_message = "Generate my morning briefing."
+    mem_context  = memory.get_context(user_message)
+    system_prompt = (
+        "You are ACE, a highly efficient executive assistant for Joe — "
+        "an elite-level executive and entrepreneur.\n"
+        f"{mem_context}\n"
+        "Generate a sharp, concise morning briefing. Lead with priorities."
+    )
+    response_text = llm.chat(user_message, system_instruction=system_prompt)
+
+    memory.save_memory(user_id, user_message, response_text, success=True, domain="schedule")
+    await update.message.reply_text(response_text)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    user_id = update.effective_user.id
-    
-    # Fetch context from memory stub
-    mem_context = memory.get_memory(user_id)
-    
-    # Get response from LLM
-    system_prompt = f"You are ACE, a highly efficient executive assistant. Context: {mem_context}"
+    user_id   = update.effective_user.id
+
+    # ── Positive signal detection ──────────────────────────────────
+    if any(w in user_text.lower() for w in POSITIVE_SIGNALS) and len(user_text.split()) <= 4:
+        memory.signal_positive()
+        await update.message.reply_text("Noted, Sir.")
+        return
+
+    # ── Correction signal detection ────────────────────────────────
+    if any(w in user_text.lower() for w in NEGATIVE_SIGNALS) and len(user_text.split()) <= 6:
+        memory.signal_correction(user_text)
+        await update.message.reply_text("Understood. Noted and corrected.")
+        return
+
+    # ── MUSE: inject memory context into system prompt ─────────────
+    mem_context = memory.get_context(user_text)
+    system_prompt = (
+        "You are ACE, a highly efficient executive assistant for Joe — "
+        "an elite-level entrepreneur and executive.\n"
+        "Respond with precision. Be proactive. Anticipate the next step.\n"
+    )
+    if mem_context:
+        system_prompt += f"\n{mem_context}"
+
+    # ── Generate response ──────────────────────────────────────────
     response_text = llm.chat(user_text, system_instruction=system_prompt)
-    
-    # Save interaction
-    memory.save_memory(user_id, user_text, response_text)
-    
+
+    # ── MUSE: capture outcome ──────────────────────────────────────
+    memory.save_memory(user_id, user_text, response_text, success=True)
+
     await update.message.reply_text(response_text)
 
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Download voice note
     voice_file = await update.message.voice.get_file()
     audio_path = "voice_note.ogg"
     await voice_file.download_to_drive(audio_path)
-    
-    await update.message.reply_text("Processing voice note...")
-    
-    # Transcribe
+    await update.message.reply_text("Processing...")
+
     transcribed_text = voice.transcribe(audio_path)
     if not transcribed_text:
-        await update.message.reply_text("Sorry, I couldn't transcribe your message.")
+        await update.message.reply_text("Couldn't transcribe that. Try again, Sir.")
         return
 
-    # Get LLM response
     user_id = update.effective_user.id
-    mem_context = memory.get_memory(user_id)
-    system_prompt = f"You are ACE, a highly efficient executive assistant. Context: {mem_context}"
+
+    # ── MUSE: inject context ───────────────────────────────────────
+    mem_context = memory.get_context(transcribed_text)
+    system_prompt = (
+        "You are ACE, a highly efficient executive assistant for Joe.\n"
+        "Respond with precision. Be proactive. Anticipate the next step.\n"
+    )
+    if mem_context:
+        system_prompt += f"\n{mem_context}"
+
+    # ── Generate response ──────────────────────────────────────────
     response_text = llm.chat(transcribed_text, system_instruction=system_prompt)
-    
-    # Convert response to speech
+
+    # ── MUSE: capture outcome ──────────────────────────────────────
+    memory.save_memory(user_id, transcribed_text, response_text, success=True)
+
+    # ── Voice response ─────────────────────────────────────────────
     audio_response_path = voice.text_to_speech(response_text)
-    
     if audio_response_path:
-        with open(audio_response_path, 'rb') as audio_file:
+        with open(audio_response_path, "rb") as audio_file:
             await update.message.reply_voice(voice=audio_file)
     else:
         await update.message.reply_text(response_text)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        print("Error: TELEGRAM_BOT_TOKEN not found in environment.")
+        print("Error: TELEGRAM_BOT_TOKEN not found.")
     else:
         application = ApplicationBuilder().token(token).build()
-        
-        # Handlers
-        application.add_handler(CommandHandler('start', start))
-        application.add_handler(CommandHandler('status', status))
-        application.add_handler(CommandHandler('morning', morning))
+
+        application.add_handler(CommandHandler("start",   start))
+        application.add_handler(CommandHandler("status",  status))
+        application.add_handler(CommandHandler("morning", morning))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-        
-        print("ACE Bot is waking up...")
+
+        print("ACE Bot v2.0.0 — MUSE MEMORY ONLINE")
+        print("Waiting for Joe...")
         application.run_polling()
